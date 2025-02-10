@@ -6,12 +6,14 @@ import time
 import os
 import firebase_admin
 from firebase_admin import credentials, firestore
+from datetime import datetime
+import pytz
 
 app = Flask(__name__)
 CORS(app)
 
 UPLOAD_FOLDER = 'uploads'
-ALLOWED_EXTENSIONS = {'wav', 'mp3', 'ogg', 'flac', 'm4a'}
+ALLOWED_EXTENSIONS = {'wav', 'mp3', 'ogg', 'flac', 'm4a', 'mp4', 'wma', 'aac', 'opus', '3gp'}
 
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
@@ -28,6 +30,11 @@ headers = {'authorization': ASSEMBLYAI_API_KEY}
 def allowed_file(filename):
     """Check if the uploaded file has a valid audio extension."""
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def get_ist_timestamp():
+    """Returns the current date and time in IST (Indian Standard Time)."""
+    ist = pytz.timezone('Asia/Kolkata')
+    return datetime.now(ist).strftime('%Y-%m-%d %H:%M:%S')
 
 def transcribe_audio(file_path):
     """Uploads audio and gets transcription from AssemblyAI."""
@@ -92,16 +99,33 @@ def upload_audio():
     if isinstance(transcription_response, dict) and "error" in transcription_response:
         return jsonify(transcription_response), 500
 
-    # Extract transcription as plain text
-    transcription_text = "\n".join([f"Speaker {u['speaker']}: {u['text']}" for u in transcription_response.get('utterances', [])])
+    # Format transcription
+    speaker_map = {}
+    speaker_counter = 0
+    formatted_transcription = ""
+
+    for utterance in transcription_response.get('utterances', []):
+        speaker = utterance['speaker']
+        
+        # Assign an alphabet (A, B, C...) to each unique speaker
+        if speaker not in speaker_map:
+            speaker_map[speaker] = chr(65 + speaker_counter)  # 'A', 'B', 'C', ...
+            speaker_counter += 1
+            
+        topic="TRANSCRIPITON OF AUDIO"
+        formatted_transcription += f"Speaker {speaker_map[speaker]}: {utterance['text']}\n\n"
+
+    # Get IST timestamp
+    server_timestamp = get_ist_timestamp()
 
     # Save metadata in Firestore
     file_metadata = {
-        "Response": transcription_text  # Storing as plain text
+        "Response": topic+"\n\n"+formatted_transcription.strip(),
+        "Server_Timestamp": server_timestamp
     }
 
     try:
-        db.collection("ProcessedDocs").document(user_id).collection("UserFiles").document(file_name).update(file_metadata)
+        db.collection("ProcessedDocs").document(user_id).collection("UserFiles").document(file_name).set(file_metadata, merge=True)
         return jsonify({"message": "File uploaded and transcribed successfully", "data": file_metadata})
     except Exception as e:
         return jsonify({"error": f"Failed to save to Firestore: {str(e)}"}), 500
