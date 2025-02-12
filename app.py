@@ -8,6 +8,7 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 from datetime import datetime
 import pytz
+import threading
 
 app = Flask(__name__)
 CORS(app)
@@ -69,9 +70,45 @@ def transcribe_audio(file_path):
     except Exception as e:
         return {"error": str(e)}
 
+
+def process_transcription(file_path, user_id, file_name):
+    """Handles transcription and Firestore update in a background thread."""
+    transcription_response = transcribe_audio(file_path)
+
+    if isinstance(transcription_response, dict) and "error" in transcription_response:
+        print(f"Transcription failed for {file_name}: {transcription_response['error']}")
+        return
+
+    speaker_map = {}
+    speaker_counter = 0
+    formatted_transcription = ""
+
+    for utterance in transcription_response.get('utterances', []):
+        speaker = utterance['speaker']
+        if speaker not in speaker_map:
+            speaker_map[speaker] = chr(65 + speaker_counter)  # Assign A, B, C...
+            speaker_counter += 1
+
+        topic = "TRANSCRIPTION OF AUDIO"
+        formatted_transcription += f"Speaker {speaker_map[speaker]}: {utterance['text']}\n\n"
+
+    server_timestamp = get_ist_timestamp()
+    file_metadata = {
+        "Response": topic + "\n\n" + formatted_transcription.strip(),
+        "status":"processed",
+        "Server_Timestamp": server_timestamp,
+        "Notification": "On"
+    }
+
+    try:
+        db.collection("ProcessedDocs").document(user_id).collection("UserFiles").document(file_name).set(file_metadata, merge=True)
+        print(f"Transcription saved successfully for {file_name}")
+    except Exception as e:
+        print(f"Failed to save transcription for {file_name}: {str(e)}")
+
 @app.route('/upload', methods=['POST'])
 def upload_audio():
-    """Handles audio file upload, transcribes it, and saves text response directly in Firestore."""
+    """Handles audio file upload and starts transcription in the background."""
     if 'file' not in request.files:
         return jsonify({"error": "No file part"}), 400
 
@@ -93,42 +130,10 @@ def upload_audio():
     file_path = os.path.join(UPLOAD_FOLDER, filename)
     file.save(file_path)
 
-    # Transcribe the audio
-    transcription_response = transcribe_audio(file_path)
+    # Start transcription in a separate thread
+    threading.Thread(target=process_transcription, args=(file_path, user_id, file_name)).start()
 
-    if isinstance(transcription_response, dict) and "error" in transcription_response:
-        return jsonify(transcription_response), 500
-
-    # Format transcription
-    speaker_map = {}
-    speaker_counter = 0
-    formatted_transcription = ""
-
-    for utterance in transcription_response.get('utterances', []):
-        speaker = utterance['speaker']
-        
-        # Assign an alphabet (A, B, C...) to each unique speaker
-        if speaker not in speaker_map:
-            speaker_map[speaker] = chr(65 + speaker_counter)  # 'A', 'B', 'C', ...
-            speaker_counter += 1
-            
-        topic="TRANSCRIPITON OF AUDIO"
-        formatted_transcription += f"Speaker {speaker_map[speaker]}: {utterance['text']}\n\n"
-
-    # Get IST timestamp
-    server_timestamp = get_ist_timestamp()
-
-    # Save metadata in Firestore
-    file_metadata = {
-        "Response": topic+"\n\n"+formatted_transcription.strip(),
-        "Server_Timestamp": server_timestamp
-    }
-
-    try:
-        db.collection("ProcessedDocs").document(user_id).collection("UserFiles").document(file_name).set(file_metadata, merge=True)
-        return jsonify({"message": "File uploaded and transcribed successfully", "data": file_metadata})
-    except Exception as e:
-        return jsonify({"error": f"Failed to save to Firestore: {str(e)}"}), 500
+    return jsonify({"message": "File uploaded successfully. Transcription is processing in the background."}), 200
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)
